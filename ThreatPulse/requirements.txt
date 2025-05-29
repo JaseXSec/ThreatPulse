@@ -1,0 +1,14 @@
+flask==3.0.2
+typer==0.9.0
+requests==2.31.0
+python-dotenv==1.0.1
+rich==13.7.0
+aiohttp==3.9.3
+tailwindcss==3.4.1
+pydantic==2.6.1
+fastapi==0.109.2
+uvicorn==0.27.1
+cabby==0.1.23  # For TAXII feed access
+stix2==3.0.1   # For STIX format parsing
+python-dateutil==2.8.2
+APScheduler==3.10.4  # For background data refresh 
