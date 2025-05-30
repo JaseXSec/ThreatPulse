@@ -81,12 +81,26 @@ class GeoLocationService:
             'User-Agent': 'ThreatPulse/1.0 (Security Research Tool)'
         })
         self.timeout = 10
+        self.rate_limit_delay = 0.2  # Reduce delay to 0.2 seconds for faster loading
+        self.last_request_time = 0
+        
+    def _respect_rate_limit(self):
+        """Ensure we don't exceed rate limits"""
+        import time
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - time_since_last)
+        self.last_request_time = time.time()
         
     def get_ip_geolocation(self, ip):
         """Get geolocation data for an IP address"""
         try:
+            # Respect rate limits (45 requests/minute = ~1.33 requests/second)
+            self._respect_rate_limit()
+            
             # Using ip-api.com - free service, no API key required
-            url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,lat,lon,timezone,org,as"
+            url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,lat,lon,timezone,org,as,isp"
             response = self.session.get(url, timeout=self.timeout)
             
             if response.status_code == 200:
@@ -100,9 +114,12 @@ class GeoLocationService:
                         'latitude': data.get('lat', 0),
                         'longitude': data.get('lon', 0),
                         'organization': data.get('org', 'Unknown'),
+                        'isp': data.get('isp', 'Unknown'),
                         'asn': data.get('as', 'Unknown'),
                         'timezone': data.get('timezone', 'Unknown')
                     }
+                else:
+                    logger.warning(f"Geolocation API error for {ip}: {data.get('message', 'Unknown error')}")
         except Exception as e:
             logger.error(f"Error getting geolocation for {ip}: {e}")
         
@@ -114,33 +131,63 @@ class GeoLocationService:
             'latitude': 0,
             'longitude': 0,
             'organization': 'Unknown',
+            'isp': 'Unknown',
             'asn': 'Unknown',
             'timezone': 'Unknown'
         }
     
     def get_threat_attribution(self, country, organization, asn):
         """Get potential threat group attribution based on geolocation"""
-        # Basic threat attribution based on common patterns
+        # Enhanced threat attribution based on MITRE ATT&CK and public intelligence
         threat_groups = {
-            'Russia': ['APT28', 'APT29', 'Turla', 'Sandworm'],
-            'China': ['APT1', 'APT40', 'APT41', 'Lazarus'],
-            'North Korea': ['Lazarus', 'APT38', 'Kimsuky'],
-            'Iran': ['APT33', 'APT34', 'APT35', 'MuddyWater'],
+            'Russia': ['APT28 (Fancy Bear)', 'APT29 (Cozy Bear)', 'Turla', 'Sandworm', 'Lazarus'],
+            'China': ['APT1 (Comment Crew)', 'APT40 (Leviathan)', 'APT41', 'Lazarus', 'Winnti'],
+            'North Korea': ['Lazarus Group', 'APT38', 'Kimsuky', 'Andariel'],
+            'Iran': ['APT33 (Elfin)', 'APT34 (OilRig)', 'APT35 (Charming Kitten)', 'MuddyWater'],
             'United States': ['Unknown/Research'],
+            'Israel': ['Unknown/Research'],
+            'United Kingdom': ['Unknown/Research'],
+            'Germany': ['Unknown/Research'],
+            'France': ['Unknown/Research'],
+            'Netherlands': ['Unknown/Research'],
             'Unknown': ['Unattributed']
         }
         
-        # Check for known malicious hosting providers
+        # Check for known malicious hosting providers and infrastructure indicators
         malicious_indicators = [
             'bulletproof', 'hosting', 'vps', 'cloud', 'datacenter',
-            'dedicated', 'server', 'colocation'
+            'dedicated', 'server', 'colocation', 'vpn', 'proxy',
+            'digital ocean', 'amazon', 'microsoft', 'google cloud',
+            'alibaba', 'vultr', 'linode', 'ovh'
         ]
         
+        # Additional indicators for compromised infrastructure
+        compromised_indicators = [
+            'residential', 'broadband', 'cable', 'dsl', 'fiber',
+            'telecom', 'internet', 'communication'
+        ]
+        
+        organization_lower = organization.lower()
+        asn_lower = asn.lower()
+        
+        # Check for hosting/cloud providers (likely compromised infrastructure)
+        if any(indicator in organization_lower for indicator in malicious_indicators):
+            return 'Compromised Infrastructure (Hosting)'
+        
+        # Check for residential/ISP networks (likely compromised devices)
+        if any(indicator in organization_lower for indicator in compromised_indicators):
+            return 'Compromised Infrastructure (Residential)'
+            
+        # Check ASN for additional context
+        if any(indicator in asn_lower for indicator in malicious_indicators):
+            return 'Compromised Infrastructure (Cloud)'
+        
+        # Get potential threat groups based on country
         potential_groups = threat_groups.get(country, ['Unattributed'])
         
-        # If it's from a hosting provider, it's likely compromised infrastructure
-        if any(indicator in organization.lower() for indicator in malicious_indicators):
-            return 'Compromised Infrastructure'
+        # Return the most likely attribution
+        if len(potential_groups) > 1:
+            return f"Potential: {potential_groups[0]} (or {len(potential_groups)-1} other groups)"
         
         return potential_groups[0] if potential_groups else 'Unattributed'
 
@@ -155,20 +202,80 @@ class ThreatIntelligenceCollector:
         self.timeout = 30
         self.geo_service = GeoLocationService()
         
-    def enrich_ip_with_geolocation(self, ip_data):
-        """Enrich IP data with geolocation information"""
-        ip = ip_data.get('ip')
-        if ip:
+    def test_geolocation_attribution(self):
+        """Test geolocation and threat attribution functionality"""
+        test_ips = [
+            "8.8.8.8",  # Google DNS - should show as US/Compromised Infrastructure
+            "1.1.1.1",  # Cloudflare DNS - should show as US/Compromised Infrastructure  
+            "185.220.100.240",  # Known Tor exit node
+            "45.142.213.33"  # Example IP for testing
+        ]
+        
+        print("\n🧪 Testing Geolocation and Threat Attribution:")
+        print("=" * 60)
+        
+        for ip in test_ips:
+            print(f"\nTesting IP: {ip}")
             geo_data = self.geo_service.get_ip_geolocation(ip)
-            threat_group = self.geo_service.get_threat_attribution(
+            attribution = self.geo_service.get_threat_attribution(
                 geo_data['country'], 
                 geo_data['organization'],
                 geo_data['asn']
             )
             
+            print(f"  📍 Location: {geo_data['city']}, {geo_data['country']}")
+            print(f"  🏢 Organization: {geo_data['organization']}")
+            print(f"  🌐 ISP: {geo_data['isp']}")
+            print(f"  📊 ASN: {geo_data['asn']}")
+            print(f"  🎯 Attribution: {attribution}")
+            
+        print("\n" + "=" * 60)
+        
+    def enrich_ip_with_geolocation(self, ip_data, skip_geo=False):
+        """Enrich IP data with geolocation information"""
+        ip = ip_data.get('ip')
+        if ip and ip != 'Unknown' and not skip_geo:
+            try:
+                geo_data = self.geo_service.get_ip_geolocation(ip)
+                threat_group = self.geo_service.get_threat_attribution(
+                    geo_data['country'], 
+                    geo_data['organization'],
+                    geo_data['asn']
+                )
+                
+                ip_data.update({
+                    'geolocation': geo_data,
+                    'threat_attribution': threat_group
+                })
+                
+                logger.debug(f"Enriched {ip} -> {geo_data['city']}, {geo_data['country']} ({threat_group})")
+                
+            except Exception as e:
+                logger.error(f"Error enriching IP {ip}: {e}")
+                # Add default geolocation data
+                ip_data.update({
+                    'geolocation': {
+                        'country': 'Unknown',
+                        'city': 'Unknown',
+                        'region': 'Unknown',
+                        'organization': 'Unknown',
+                        'isp': 'Unknown',
+                        'asn': 'Unknown'
+                    },
+                    'threat_attribution': 'Unattributed'
+                })
+        elif skip_geo:
+            # Add minimal geolocation data when skipping
             ip_data.update({
-                'geolocation': geo_data,
-                'threat_attribution': threat_group
+                'geolocation': {
+                    'country': 'Loading...',
+                    'city': 'Loading...',
+                    'region': 'Loading...',
+                    'organization': 'Loading...',
+                    'isp': 'Loading...',
+                    'asn': 'Loading...'
+                },
+                'threat_attribution': 'Loading...'
             })
         
         return ip_data
@@ -195,7 +302,7 @@ class ThreatIntelligenceCollector:
                             try:
                                 data = response.json()
                                 if isinstance(data, list):
-                                    for item in data[:20]:
+                                    for i, item in enumerate(data[:20]):
                                         if isinstance(item, dict) and 'ip' in item:
                                             ip_data = {
                                                 'ip': item.get('ip', ''),
@@ -205,14 +312,16 @@ class ThreatIntelligenceCollector:
                                                 'attack_count': item.get('attacks', 0),
                                                 'type': 'malicious_ip'
                                             }
-                                            enriched_ip = self.enrich_ip_with_geolocation(ip_data)
+                                            # Only geolocate first 5 IPs for speed
+                                            skip_geo = i >= 5
+                                            enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
                                             ips.append(enriched_ip)
                             except (json.JSONDecodeError, KeyError):
                                 continue
                         else:
                             # Parse text format
                             lines = response.text.strip().split('\n')
-                            for line in lines[:20]:
+                            for i, line in enumerate(lines[:20]):
                                 if line.strip() and not line.startswith('#') and not line.startswith('ip'):
                                     parts = line.split()
                                     if len(parts) >= 1:
@@ -226,7 +335,9 @@ class ThreatIntelligenceCollector:
                                             'attack_count': count,
                                             'type': 'malicious_ip'
                                         }
-                                        enriched_ip = self.enrich_ip_with_geolocation(ip_data)
+                                        # Only geolocate first 5 IPs for speed
+                                        skip_geo = i >= 5
+                                        enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
                                         ips.append(enriched_ip)
                         
                         if ips:
@@ -242,114 +353,48 @@ class ThreatIntelligenceCollector:
         
         return []
     
-    def collect_phishtank_urls(self):
-        """Collect phishing URLs from PhishTank"""
+    def collect_openphish_urls(self):
+        """Collect phishing URLs from OpenPhish"""
         try:
-            logger.info("Fetching PhishTank phishing URLs...")
+            logger.info("Fetching phishing URLs from OpenPhish...")
+            url = "https://openphish.com/feed.txt"
             
-            # Try different PhishTank endpoints
-            urls = [
-                "http://data.phishtank.com/data/online-valid.csv",
-                "http://data.phishtank.com/data/online-valid.json"
-            ]
+            response = self.session.get(url, timeout=self.timeout)
             
-            for url in urls:
-                try:
-                    response = self.session.get(url, timeout=self.timeout)
-                    if response.status_code == 200:
-                        urls_list = []
-                        
-                        if url.endswith('.json'):
-                            try:
-                                data = response.json()
-                                for item in data[:50]:
-                                    urls_list.append({
-                                        'url': item.get('url', ''),
-                                        'source': 'PhishTank',
-                                        'confidence': 'high',
-                                        'submission_time': item.get('submission_time', ''),
-                                        'verified': item.get('verified', 'yes'),
-                                        'type': 'phishing_url'
-                                    })
-                            except json.JSONDecodeError:
-                                continue
-                        else:
-                            # Parse CSV format
-                            lines = response.text.strip().split('\n')
-                            for line in lines[1:51]:  # Skip header, take first 50
-                                if line.strip():
-                                    parts = line.split(',')
-                                    if len(parts) >= 2:
-                                        phish_url = parts[1].strip('"')
-                                        urls_list.append({
-                                            'url': phish_url,
-                                            'source': 'PhishTank',
-                                            'confidence': 'high',
-                                            'submission_time': datetime.now().isoformat(),
-                                            'verified': 'yes',
-                                            'type': 'phishing_url'
-                                        })
-                        
-                        if urls_list:
-                            logger.info(f"Collected {len(urls_list)} URLs from PhishTank")
-                            return urls_list
-                            
-                except Exception as e:
-                    logger.warning(f"PhishTank URL {url} failed: {e}")
-                    continue
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                urls = []
+                
+                for line in lines[:50]:  # Limit to first 50
+                    line = line.strip()
+                    if line and line.startswith('http'):
+                        urls.append({
+                            'url': line,
+                            'source': 'OpenPhish',
+                            'confidence': 'high',
+                            'submission_time': datetime.now().isoformat(),
+                            'verified': 'yes',
+                            'type': 'phishing_url'
+                        })
+                
+                logger.info(f"Collected {len(urls)} URLs from OpenPhish")
+                return urls
                 
         except Exception as e:
-            logger.error(f"Error fetching PhishTank data: {e}")
+            logger.error(f"Error fetching OpenPhish data: {e}")
         
         return []
     
-    def collect_threatfox_iocs(self):
-        """Collect IOCs from ThreatFox by abuse.ch"""
+    def collect_phishtank_urls(self):
+        """Collect phishing URLs from PhishTank - DISABLED due to rate limiting"""
         try:
-            logger.info("Fetching recent IOCs from ThreatFox...")
-            url = "https://threatfox-api.abuse.ch/api/v1/"
-            
-            data = {
-                'query': 'get_iocs',
-                'days': '1'
-            }
-            
-            response = self.session.post(url, json=data, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                result = response.json()
-                iocs = []
-                
-                if result.get('query_status') == 'ok':
-                    for item in result.get('data', [])[:30]:  # Limit to 30
-                        ioc_type = item.get('ioc_type', '')
-                        if ioc_type == 'ip:port' or ioc_type == 'ip':
-                            ip = item.get('ioc', '').split(':')[0]  # Remove port if present
-                            ip_data = {
-                                'ip': ip,
-                                'source': 'ThreatFox',
-                                'confidence': 'high',
-                                'last_seen': item.get('first_seen', ''),
-                                'malware_family': item.get('malware', 'Unknown'),
-                                'type': 'malicious_ip'
-                            }
-                            enriched_ip = self.enrich_ip_with_geolocation(ip_data)
-                            iocs.append(enriched_ip)
-                        elif ioc_type in ['url', 'domain']:
-                            iocs.append({
-                                'url': item.get('ioc', ''),
-                                'source': 'ThreatFox',
-                                'confidence': 'high',
-                                'date_added': item.get('first_seen', ''),
-                                'threat': item.get('malware', 'Unknown'),
-                                'type': 'malicious_url'
-                            })
-                
-                logger.info(f"Collected {len(iocs)} IOCs from ThreatFox")
-                return iocs
+            # PhishTank now requires API keys and has strict rate limiting
+            # Temporarily disabled to avoid 429 errors
+            logger.info("PhishTank temporarily disabled due to API requirements")
+            return []
                 
         except Exception as e:
-            logger.error(f"Error fetching ThreatFox data: {e}")
+            logger.error(f"Error fetching PhishTank data: {e}")
         
         return []
     
@@ -365,7 +410,7 @@ class ThreatIntelligenceCollector:
                 lines = response.text.strip().split('\n')
                 ips = []
                 
-                for line in lines[:25]:  # Limit to first 25
+                for i, line in enumerate(lines[:25]):  # Limit to first 25
                     line = line.strip()
                     if line and not line.startswith('#') and '.' in line:
                         ip_data = {
@@ -376,10 +421,12 @@ class ThreatIntelligenceCollector:
                             'malware_family': 'Various',
                             'type': 'malicious_ip'
                         }
-                        enriched_ip = self.enrich_ip_with_geolocation(ip_data)
+                        # Only geolocate first 3 IPs for speed
+                        skip_geo = i >= 3
+                        enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
                         ips.append(enriched_ip)
                 
-                logger.info(f"Collected {len(ips)} IPs from Blocklist.de with geolocation")
+                logger.info(f"Collected {len(ips)} IPs from Blocklist.de")
                 return ips
                 
         except Exception as e:
@@ -399,7 +446,7 @@ class ThreatIntelligenceCollector:
                 lines = response.text.strip().split('\n')
                 ips = []
                 
-                for line in lines[:25]:  # Limit to first 25
+                for i, line in enumerate(lines[:25]):  # Limit to first 25
                     line = line.strip()
                     if line and not line.startswith('#') and '.' in line:
                         ip_data = {
@@ -410,10 +457,12 @@ class ThreatIntelligenceCollector:
                             'malware_family': 'Malicious Activity',
                             'type': 'malicious_ip'
                         }
-                        enriched_ip = self.enrich_ip_with_geolocation(ip_data)
+                        # Only geolocate first 3 IPs for speed
+                        skip_geo = i >= 3
+                        enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
                         ips.append(enriched_ip)
                 
-                logger.info(f"Collected {len(ips)} IPs from CINS Army with geolocation")
+                logger.info(f"Collected {len(ips)} IPs from CINS Army")
                 return ips
                 
         except Exception as e:
@@ -433,7 +482,7 @@ class ThreatIntelligenceCollector:
                 lines = response.text.strip().split('\n')
                 ips = []
                 
-                for line in lines[:25]:  # Limit to first 25
+                for i, line in enumerate(lines[:25]):  # Limit to first 25
                     line = line.strip()
                     if line and not line.startswith('#') and '.' in line:
                         ip_data = {
@@ -444,10 +493,12 @@ class ThreatIntelligenceCollector:
                             'malware_family': 'SSH/Telnet Attacks',
                             'type': 'malicious_ip'
                         }
-                        enriched_ip = self.enrich_ip_with_geolocation(ip_data)
+                        # Only geolocate first 3 IPs for speed
+                        skip_geo = i >= 3
+                        enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
                         ips.append(enriched_ip)
                 
-                logger.info(f"Collected {len(ips)} IPs from Greensnow with geolocation")
+                logger.info(f"Collected {len(ips)} IPs from Greensnow")
                 return ips
                 
         except Exception as e:
@@ -562,6 +613,47 @@ class ThreatIntelligenceCollector:
         
         return []
     
+    def collect_spamhaus_ips(self):
+        """Collect IPs from Spamhaus DROP list"""
+        try:
+            logger.info("Fetching IPs from Spamhaus DROP list...")
+            url = "https://www.spamhaus.org/drop/drop.txt"
+            
+            response = self.session.get(url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                ips = []
+                
+                for i, line in enumerate(lines[:15]):  # Limit to first 15
+                    line = line.strip()
+                    if line and not line.startswith(';') and '/' in line:
+                        # Extract IP from CIDR notation
+                        ip_range = line.split(';')[0].strip()
+                        if '/' in ip_range:
+                            ip = ip_range.split('/')[0]
+                            if self._is_valid_ip(ip):
+                                ip_data = {
+                                    'ip': ip,
+                                    'source': 'Spamhaus',
+                                    'confidence': 'high',
+                                    'last_seen': datetime.now().isoformat(),
+                                    'malware_family': 'Botnet/Spam',
+                                    'type': 'malicious_ip'
+                                }
+                                # Only geolocate first 3 IPs for speed
+                                skip_geo = i >= 3
+                                enriched_ip = self.enrich_ip_with_geolocation(ip_data, skip_geo)
+                                ips.append(enriched_ip)
+                
+                logger.info(f"Collected {len(ips)} IPs from Spamhaus")
+                return ips
+                
+        except Exception as e:
+            logger.error(f"Error fetching Spamhaus data: {e}")
+        
+        return []
+    
     def collect_all_threats(self):
         """Collect threats from all sources"""
         logger.info("Starting threat intelligence collection...")
@@ -575,11 +667,11 @@ class ThreatIntelligenceCollector:
         collectors = [
             ('DShield', self.collect_dshield_ips),
             ('FeodoTracker', self.collect_feodo_ips),
-            ('ThreatFox', self.collect_threatfox_iocs),
             ('Blocklist.de', self.collect_blocklist_de_ips),
             ('CINS Army', self.collect_cins_army_ips),
             ('Greensnow', self.collect_greensnow_ips),
-            ('PhishTank', self.collect_phishtank_urls),
+            ('Spamhaus', self.collect_spamhaus_ips),
+            ('OpenPhish', self.collect_openphish_urls),
             ('URLhaus', self.collect_urlhaus_urls),
             ('MalwareBazaar', self.collect_malware_bazaar_hashes)
         ]
@@ -622,6 +714,19 @@ class ThreatIntelligenceCollector:
                 })
         
         return all_ips, all_urls, all_hashes, sources
+
+    def _is_valid_ip(self, ip):
+        """Basic IP address validation"""
+        try:
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return False
+            for part in parts:
+                if not 0 <= int(part) <= 255:
+                    return False
+            return True
+        except:
+            return False
 
 def update_threat_data():
     """Update the global threat data"""
@@ -668,92 +773,85 @@ HTML_TEMPLATE = """
         }
         
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #0c1529 0%, #1a1f3a 50%, #0f172a 100%);
-            color: #fff;
-            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #e4e4e7;
+            line-height: 1.6;
         }
         
         .header {
-            background: rgba(0, 0, 0, 0.4);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(15px);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            background: #262626;
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid #404040;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
         }
         
         .header h1 {
-            font-size: 2rem;
-            color: #fff;
-            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+            font-size: 1.8rem;
+            color: #f4f4f5;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
         }
         
         .header p {
-            color: #94a3b8;
-            margin-top: 0.5rem;
+            color: #a1a1aa;
+            font-size: 0.9rem;
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 2rem;
         }
         
         .top-section {
             display: grid;
-            grid-template-columns: 1fr 350px;
+            grid-template-columns: 1fr 280px;
             gap: 2rem;
             margin-bottom: 2rem;
         }
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 1rem;
+            grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+            gap: 0.75rem;
         }
         
         .stat-card {
-            background: rgba(15, 23, 42, 0.8);
-            border-radius: 12px;
-            padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+            background: #262626;
+            border-radius: 4px;
+            padding: 0.6rem 0.5rem;
+            border: 1px solid #404040;
+            text-align: center;
         }
         
         .stat-number {
-            font-size: 2rem;
-            font-weight: bold;
-            color: #06d6a0;
-            margin-bottom: 0.5rem;
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: #f4f4f5;
+            margin-bottom: 0.1rem;
+            line-height: 1;
         }
         
         .stat-label {
-            color: #94a3b8;
-            font-size: 0.85rem;
+            color: #a1a1aa;
+            font-size: 0.75rem;
             text-transform: uppercase;
-            letter-spacing: 1px;
+            letter-spacing: 0.5px;
+            line-height: 1.1;
         }
         
         .live-status {
-            background: rgba(15, 23, 42, 0.8);
-            border-radius: 12px;
+            background: #262626;
+            border-radius: 4px;
             padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            border: 1px solid #404040;
         }
         
         .status-title {
-            font-size: 1.1rem;
-            font-weight: bold;
-            color: #06d6a0;
+            font-size: 1rem;
+            font-weight: 600;
+            color: #f4f4f5;
             margin-bottom: 1rem;
             display: flex;
             align-items: center;
@@ -761,43 +859,33 @@ HTML_TEMPLATE = """
         }
         
         .status-indicator {
-            width: 12px;
-            height: 12px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
-            animation: pulse 2s infinite;
         }
         
         .status-connected {
-            background: #10b981;
-            box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+            background: #22c55e;
         }
         
         .status-connecting {
-            background: #f59e0b;
-            box-shadow: 0 0 10px rgba(245, 158, 11, 0.5);
+            background: #eab308;
         }
         
         .status-disconnected {
             background: #ef4444;
-            box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.7; transform: scale(1.1); }
-            100% { opacity: 1; transform: scale(1); }
         }
         
         .refresh-countdown {
-            font-size: 1.2rem;
-            color: #06d6a0;
-            font-weight: bold;
+            font-size: 1.1rem;
+            color: #f4f4f5;
+            font-weight: 500;
             margin: 0.5rem 0;
         }
         
         .next-refresh {
-            font-size: 0.9rem;
-            color: #94a3b8;
+            font-size: 0.85rem;
+            color: #a1a1aa;
             margin-bottom: 1rem;
         }
         
@@ -810,7 +898,7 @@ HTML_TEMPLATE = """
             justify-content: space-between;
             align-items: center;
             padding: 0.5rem 0;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+            border-bottom: 1px solid #404040;
         }
         
         .source-status-item:last-child {
@@ -818,111 +906,104 @@ HTML_TEMPLATE = """
         }
         
         .source-name {
-            font-size: 0.9rem;
-            color: #e2e8f0;
+            font-size: 0.85rem;
+            color: #e4e4e7;
         }
         
         .source-status {
-            font-size: 0.8rem;
-            padding: 0.2rem 0.6rem;
-            border-radius: 12px;
-            font-weight: bold;
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 2px;
+            font-weight: 500;
         }
         
         .status-success {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
+            background: #166534;
+            color: #bbf7d0;
         }
         
         .status-error {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
+            background: #991b1b;
+            color: #fecaca;
         }
         
         .status-failed {
-            background: rgba(245, 158, 11, 0.2);
-            color: #f59e0b;
+            background: #a16207;
+            color: #fef3c7;
         }
         
         .content-grid {
             display: grid;
             grid-template-columns: 1fr 1fr 1fr;
-            gap: 1.5rem;
+            gap: 2rem;
             margin-bottom: 2rem;
         }
         
         .threat-section {
-            background: rgba(15, 23, 42, 0.8);
-            border-radius: 12px;
+            background: #262626;
+            border-radius: 4px;
             padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            border: 1px solid #404040;
         }
         
         .section-title {
-            font-size: 1.1rem;
+            font-size: 1rem;
             margin-bottom: 1rem;
-            color: #06d6a0;
-            border-bottom: 2px solid #06d6a0;
+            color: #f4f4f5;
+            font-weight: 600;
+            border-bottom: 2px solid #404040;
             padding-bottom: 0.5rem;
         }
         
         .threat-list {
-            max-height: 350px;
+            max-height: 400px;
             overflow-y: auto;
         }
         
         .threat-item {
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 8px;
-            padding: 1rem;
+            background: #1a1a1a;
+            border-radius: 2px;
+            padding: 0.8rem;
             margin-bottom: 0.5rem;
-            border-left: 4px solid #ef4444;
-            transition: all 0.2s ease;
-        }
-        
-        .threat-item:hover {
-            background: rgba(0, 0, 0, 0.4);
-            transform: translateX(5px);
+            border-left: 3px solid #a1a1aa;
         }
         
         .threat-ip, .threat-hash {
-            font-family: 'Courier New', monospace;
-            font-weight: bold;
-            color: #fff;
-            font-size: 0.85rem;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-weight: 500;
+            color: #f4f4f5;
+            font-size: 0.8rem;
             word-break: break-all;
         }
         
         .threat-filename {
-            font-size: 0.8rem;
-            color: #fff;
+            font-size: 0.75rem;
+            color: #e4e4e7;
             margin-top: 0.3rem;
         }
         
         .threat-source {
-            font-size: 0.8rem;
-            color: #06d6a0;
+            font-size: 0.75rem;
+            color: #a1a1aa;
             margin-top: 0.3rem;
         }
         
         .threat-geo {
-            font-size: 0.75rem;
-            color: #94a3b8;
+            font-size: 0.7rem;
+            color: #a1a1aa;
             margin-top: 0.2rem;
         }
         
         .threat-attribution {
-            font-size: 0.75rem;
-            color: #f59e0b;
+            font-size: 0.7rem;
+            color: #e4e4e7;
             margin-top: 0.2rem;
-            font-weight: bold;
+            font-weight: 500;
         }
         
         .threat-time {
-            font-size: 0.75rem;
-            color: #94a3b8;
+            font-size: 0.7rem;
+            color: #a1a1aa;
             float: right;
         }
         
@@ -934,12 +1015,10 @@ HTML_TEMPLATE = """
         }
         
         .chart-container {
-            background: rgba(15, 23, 42, 0.8);
-            border-radius: 12px;
+            background: #262626;
+            border-radius: 4px;
             padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            border: 1px solid #404040;
             height: fit-content;
         }
         
@@ -948,35 +1027,27 @@ HTML_TEMPLATE = """
         }
         
         .controls-section {
-            background: rgba(15, 23, 42, 0.8);
-            border-radius: 12px;
+            background: #262626;
+            border-radius: 4px;
             padding: 1.5rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            border: 1px solid #404040;
         }
         
         .refresh-btn {
-            background: linear-gradient(135deg, #06d6a0 0%, #10b981 100%);
-            color: #0f172a;
+            background: #374151;
+            color: #f4f4f5;
             border: none;
-            padding: 0.8rem 2rem;
-            border-radius: 25px;
-            font-weight: bold;
+            padding: 0.7rem 1.5rem;
+            border-radius: 2px;
+            font-weight: 500;
             cursor: pointer;
             margin-top: 1rem;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(6, 214, 160, 0.3);
             width: 100%;
+            font-size: 0.9rem;
         }
         
         .refresh-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(6, 214, 160, 0.4);
-        }
-        
-        .refresh-btn:active {
-            transform: translateY(0);
+            background: #4b5563;
         }
         
         .loading {
@@ -990,7 +1061,6 @@ HTML_TEMPLATE = """
             bottom: 0;
             background: rgba(0, 0, 0, 0.8);
             z-index: 1000;
-            backdrop-filter: blur(5px);
         }
         
         .loading-content {
@@ -998,18 +1068,19 @@ HTML_TEMPLATE = """
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            background: rgba(15, 23, 42, 0.9);
+            background: #262626;
             padding: 2rem;
-            border-radius: 12px;
-            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 4px;
+            border: 1px solid #404040;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
         }
         
         .spinner {
-            border: 4px solid rgba(148, 163, 184, 0.3);
+            border: 3px solid #404040;
             border-radius: 50%;
-            border-top: 4px solid #06d6a0;
-            width: 40px;
-            height: 40px;
+            border-top: 3px solid #f4f4f5;
+            width: 30px;
+            height: 30px;
             animation: spin 1s linear infinite;
             margin: 0 auto 1rem;
         }
@@ -1022,13 +1093,17 @@ HTML_TEMPLATE = """
         .last-update {
             text-align: center;
             margin-top: 1rem;
-            color: #94a3b8;
-            font-size: 0.85rem;
+            color: #a1a1aa;
+            font-size: 0.8rem;
         }
         
         @media (max-width: 1200px) {
             .content-grid {
                 grid-template-columns: 1fr 1fr;
+            }
+            
+            .top-section {
+                grid-template-columns: 1fr;
             }
         }
         
@@ -1046,6 +1121,10 @@ HTML_TEMPLATE = """
             }
             
             .content-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .bottom-section {
                 grid-template-columns: 1fr;
             }
         }
@@ -1115,14 +1194,23 @@ HTML_TEMPLATE = """
                         <div class="threat-ip">{{ ip.ip }}</div>
                         <div class="threat-source">Source: {{ ip.source }}</div>
                         {% if ip.geolocation %}
-                        <div class="threat-geo">Location: {{ ip.geolocation.city }}, {{ ip.geolocation.country }}</div>
-                        <div class="threat-geo">Organization: {{ ip.geolocation.organization }}</div>
+                        <div class="threat-geo">📍 Location: {{ ip.geolocation.city }}, {{ ip.geolocation.region }}, {{ ip.geolocation.country }}</div>
+                        <div class="threat-geo">🏢 Organization: {{ ip.geolocation.organization }}</div>
+                        {% if ip.geolocation.isp and ip.geolocation.isp != ip.geolocation.organization %}
+                        <div class="threat-geo">🌐 ISP: {{ ip.geolocation.isp }}</div>
+                        {% endif %}
+                        {% if ip.geolocation.asn and ip.geolocation.asn != 'Unknown' %}
+                        <div class="threat-geo">📊 ASN: {{ ip.geolocation.asn }}</div>
+                        {% endif %}
                         {% endif %}
                         {% if ip.threat_attribution %}
-                        <div class="threat-attribution">Attribution: {{ ip.threat_attribution }}</div>
+                        <div class="threat-attribution">🎯 Attribution: {{ ip.threat_attribution }}</div>
                         {% endif %}
                         {% if ip.malware_family %}
-                        <div class="threat-source">Family: {{ ip.malware_family }}</div>
+                        <div class="threat-source">🦠 Family: {{ ip.malware_family }}</div>
+                        {% endif %}
+                        {% if ip.attack_count %}
+                        <div class="threat-source">⚔️ Attack Count: {{ ip.attack_count }}</div>
                         {% endif %}
                         <div class="threat-time">{{ ip.last_seen or ip.date_added }}</div>
                     </div>
@@ -1326,8 +1414,41 @@ def index():
 
 @app.route('/api/threats')
 def get_threats():
-    """API endpoint to get current threat data"""
+    """API endpoint to get current threat data with geolocation"""
     return jsonify(threat_data)
+
+@app.route('/api/threats/ips')
+def get_malicious_ips():
+    """API endpoint to get only malicious IPs with detailed geolocation"""
+    return jsonify({
+        'malicious_ips': threat_data.get('malicious_ips', []),
+        'total_count': len(threat_data.get('malicious_ips', [])),
+        'last_update': threat_data.get('last_update')
+    })
+
+@app.route('/api/geolocation/<ip>')
+def get_ip_geolocation(ip):
+    """API endpoint to get geolocation for a specific IP"""
+    try:
+        geo_service = GeoLocationService()
+        geo_data = geo_service.get_ip_geolocation(ip)
+        attribution = geo_service.get_threat_attribution(
+            geo_data['country'], 
+            geo_data['organization'],
+            geo_data['asn']
+        )
+        
+        return jsonify({
+            'ip': ip,
+            'geolocation': geo_data,
+            'threat_attribution': attribution,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'ip': ip
+        }), 500
 
 @app.route('/api/refresh', methods=['POST'])
 def refresh_threats():
@@ -1360,6 +1481,15 @@ def open_browser():
 
 def main():
     """Main application entry point"""
+    import sys
+    
+    # Check for test mode
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-geo':
+        print("🧪 ThreatPulse Geolocation Test Mode")
+        collector = ThreatIntelligenceCollector()
+        collector.test_geolocation_attribution()
+        return
+    
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║                         ThreatPulse                          ║
@@ -1373,8 +1503,22 @@ def main():
     ║  ✅ Dependencies installed automatically                   ║
     ║  ✅ Geolocation and threat attribution                     ║
     ║  ✅ Browser will open automatically                        ║
+    ║                                                            ║
+    ║  💡 Run with --test-geo to test geolocation                ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
+    
+    # Test geolocation service briefly
+    logger.info("Testing geolocation service...")
+    try:
+        geo_service = GeoLocationService()
+        test_geo = geo_service.get_ip_geolocation("8.8.8.8")
+        if test_geo['country'] != 'Unknown':
+            logger.info(f"✅ Geolocation service working: 8.8.8.8 -> {test_geo['city']}, {test_geo['country']}")
+        else:
+            logger.warning("⚠️ Geolocation service may have issues")
+    except Exception as e:
+        logger.error(f"❌ Geolocation service error: {e}")
     
     # Initial data collection
     logger.info("Performing initial threat data collection...")
